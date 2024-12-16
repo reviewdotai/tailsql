@@ -6,9 +6,21 @@
  <link rel="icon" href="{{.RoutePrefix}}/static/favicon.ico" />
 </head><body id="tsql">
 
-<div class="logo">
-  <img src="{{.RoutePrefix}}/static/logo.svg" width=64 height=64 />
-  <span>TailSQL</span>
+<div class="header">
+  <div class="logo">
+    <img src="{{.RoutePrefix}}/static/logo.svg" width=64 height=64 />
+    <span>TailSQL</span>
+  </div>
+  {{with .UserInfo}}
+  <div class="user-info">
+    {{if .UserProfile}}
+      <span class="user-name">{{.UserProfile.DisplayName}}</span>
+      <span class="user-email">{{.UserProfile.LoginName}}</span>
+    {{else if .Node}}
+      <span class="user-name">{{.Node.Name}}</span>
+    {{end}}
+  </div>
+  {{end}}
 </div>
 
 <div id="input"><div id="nut"></div>{{with .Version}}
@@ -31,6 +43,24 @@
   <span class="label">Links:</span>{{range .}}
   <span><a href="{{.URL}}" target="_blank">{{.Anchor}}</a></span>{{end}}
 </div>{{end}}
+
+{{with .QueryLog}}
+<div class="query-section">
+  <div class="query-header">
+    <span class="label">Recent queries:</span>
+    <span class="summary">{{with $.QuerySummary}}{{.UniqueQueries}} {{if eq .UniqueQueries 1}}query{{else}}queries{{end}} {{if le .HoursSpan 1}}in the last hour{{else}}in {{.HoursSpan}} hours{{end}}{{end}}</span>
+    <span class="expand-arrow"><span class="arrow-symbol">▶</span></span>
+  </div>
+  <div class="query-list">
+    {{range .Rows}}
+    <div class="query-row" data-query="{{index . 0}}">
+      <pre>{{index . 0}}</pre>
+      <div class="meta">{{index . 1}} · {{formatDuration (index . 4)}} · {{index . 2}} runs{{with index . 3}} · {{.}}{{end}}</div>
+    </div>
+    {{end}}
+  </div>
+</div>
+{{end}}
 
 {{with .Error}}
 <div id="error" class="output"><div class="error">

@@ -62,6 +62,7 @@ import (
 	"fmt"
 	"html/template"
 	"io"
+	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -80,12 +81,56 @@ var uiTemplate string
 //go:embed static
 var staticFS embed.FS
 
-var ui = template.Must(template.New("sql").Parse(uiTemplate))
+var ui = template.Must(template.New("sql").Funcs(template.FuncMap{
+	"div": func(a, b int) int {
+		if b == 0 {
+			return 0
+		}
+		return a / b
+	},
+	"formatDuration": func(seconds float64) string {
+		duration := time.Duration(seconds * float64(time.Second))
+		if duration < time.Microsecond {
+			return fmt.Sprintf("%dns", duration.Nanoseconds())
+		}
+		if duration < time.Millisecond {
+			return fmt.Sprintf("%.2fµs", float64(duration.Nanoseconds())/1000)
+		}
+		if duration < time.Second {
+			return fmt.Sprintf("%.2fms", float64(duration.Nanoseconds())/1000000)
+		}
+		return fmt.Sprintf("%.2fs", seconds)
+	},
+}).Parse(uiTemplate))
 
 // noBrowsersHeader is a header that must be set in requests to the API
 // endpoints that are intended to be accessed not from browsers.  If this
 // header is not set to a non-empty value, those requests will fail.
 const noBrowsersHeader = "Sec-Tailsql"
+
+// maxRecentQueries is the maximum number of recent queries to display in the UI
+const maxRecentQueries = 10
+
+// baseRetryDelay is the base delay for exponential backoff
+const baseRetryDelay = 50 * time.Millisecond
+
+// maxRetryDelay is the maximum delay between retries
+const maxRetryDelay = 2 * time.Second
+
+// getBackoffDelay returns the delay to use for a retry attempt with jitter
+func getBackoffDelay(attempt int) time.Duration {
+	if attempt <= 0 {
+		return 0
+	}
+	// Calculate exponential delay: baseDelay * 2^attempt
+	delay := baseRetryDelay * time.Duration(1<<uint(attempt))
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+	// Add jitter: randomly adjust by ±25%
+	jitter := time.Duration(float64(delay) * (0.5 - rand.Float64()))
+	return delay + jitter
+}
 
 // siteAccessCookie is a cookie that must be presented with any request from a
 // browser that includes a query, and does not have the noBrowsersHeader.
@@ -301,6 +346,16 @@ func (s *Server) serveUIInternal(w http.ResponseWriter, r *http.Request, caller 
 		return statusErrorf(http.StatusFound, "access cookie not found (redirecting)")
 	}
 
+	// Get user information if available
+	var userInfo *apitype.WhoIsResponse
+	if s.lc != nil {
+		var err error
+		userInfo, err = s.lc.WhoIs(r.Context(), r.RemoteAddr)
+		if err != nil {
+			s.logf("[tailsql] Failed to get user info: %v", err)
+		}
+	}
+
 	w.Header().Set("Content-Type", "text/html")
 	data := &uiData{
 		Query:       q.Query,
@@ -308,7 +363,152 @@ func (s *Server) serveUIInternal(w http.ResponseWriter, r *http.Request, caller 
 		Sources:     s.getHandles(),
 		Links:       s.links,
 		RoutePrefix: s.prefix,
+		UserInfo:    userInfo,
 	}
+
+	// Fetch recent queries if local state is enabled
+	if s.state != nil {
+		// Use a retry loop for handling SQLite busy errors
+		const maxRetries = 3
+		var summaryData *QuerySummary
+		var queryLogData *dbResult
+
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				time.Sleep(getBackoffDelay(attempt))
+			}
+
+			// First get summary information
+			summaryRows, err := s.state.Query(r.Context(), `
+				WITH recent_window AS (
+					SELECT MIN(timestamp) as first_query,
+						   MAX(timestamp) as last_query,
+						   COUNT(DISTINCT query_id) as unique_queries
+					FROM raw_query_log
+					WHERE timestamp >= datetime('now', '-7 days')
+				)
+				SELECT unique_queries,
+					   CAST((julianday('now') - julianday(first_query)) * 24 as INTEGER) as hours_span
+				FROM recent_window`)
+
+			if err != nil {
+				if strings.Contains(err.Error(), "database is locked") {
+					s.logf("[tailsql] Database locked, retrying summary fetch (attempt %d): %v", attempt+1, err)
+					continue
+				}
+				s.logf("[tailsql] Failed to fetch query summary: %v", err)
+				break
+			}
+
+			if summaryRows.Next() {
+				var uniqueQueries int
+				var hoursSpan int
+				if err := summaryRows.Scan(&uniqueQueries, &hoursSpan); err == nil {
+					summaryData = &QuerySummary{
+						UniqueQueries: uniqueQueries,
+						HoursSpan:     hoursSpan,
+					}
+				}
+			}
+			summaryRows.Close()
+
+			// Then get the detailed query information
+			rows, err := s.state.Query(r.Context(), `
+				WITH ranked_queries AS (
+					SELECT q.query,
+						   l.timestamp,
+						   l.author,
+						   l.elapsed,
+						   ROW_NUMBER() OVER (PARTITION BY q.query ORDER BY l.timestamp DESC) as rn
+					FROM raw_query_log l
+					JOIN queries q ON l.query_id = q.query_id
+					WHERE l.timestamp >= datetime('now', '-7 days')
+				),
+				latest_usage AS (
+					SELECT query,
+						   timestamp as last_used,
+						   author as last_author,
+						   elapsed as last_elapsed,
+						   (SELECT COUNT(*) 
+							FROM raw_query_log l2 
+							JOIN queries q2 ON l2.query_id = q2.query_id 
+							WHERE q2.query = rq.query) as times_used
+					FROM ranked_queries rq
+					WHERE rn = 1
+				)
+				SELECT query, 
+					   datetime(last_used), 
+					   times_used, 
+					   last_author,
+					   last_elapsed / 1000000.0 as last_elapsed_seconds
+				FROM latest_usage
+				ORDER BY last_used DESC
+				LIMIT ?`, maxRecentQueries)
+
+			if err != nil {
+				if strings.Contains(err.Error(), "database is locked") {
+					s.logf("[tailsql] Database locked, retrying query log fetch (attempt %d): %v", attempt+1, err)
+					continue
+				}
+				s.logf("[tailsql] Failed to fetch query log: %v", err)
+				break
+			}
+
+			// Convert the rows to a dbResult
+			cols, err := rows.Columns()
+			if err != nil {
+				s.logf("[tailsql] Failed to get columns: %v", err)
+				rows.Close()
+				break
+			}
+
+			var result dbResult
+			result.Columns = cols
+
+			// Limit the number of recent queries to prevent unbounded memory growth
+			result.Rows = make([][]any, 0, maxRecentQueries)
+
+			for rows.Next() {
+				if len(result.Rows) >= maxRecentQueries {
+					break
+				}
+				if err := r.Context().Err(); err != nil {
+					s.logf("[tailsql] Context cancelled while scanning rows: %v", err)
+					break
+				}
+				vals := make([]any, len(cols))
+				ptrs := make([]any, len(cols))
+				for i := range vals {
+					ptrs[i] = &vals[i]
+				}
+				if err := rows.Scan(ptrs...); err != nil {
+					s.logf("[tailsql] Failed to scan row: %v", err)
+					continue
+				}
+				result.Rows = append(result.Rows, vals)
+			}
+
+			if err := rows.Err(); err != nil {
+				s.logf("[tailsql] Error iterating rows: %v", err)
+			} else {
+				result.NumRows = len(result.Rows)
+				queryLogData = &result
+			}
+			rows.Close()
+
+			// If we got here, both queries succeeded
+			break
+		}
+
+		// Set the data we retrieved (if any)
+		if summaryData != nil {
+			data.QuerySummary = summaryData
+		}
+		if queryLogData != nil {
+			data.QueryLog = queryLogData
+		}
+	}
+
 	out, err := s.queryContext(r.Context(), caller, q)
 	if errors.Is(err, errTooManyRows) {
 		out.More = true
@@ -452,10 +652,32 @@ func (s *Server) queryContext(ctx context.Context, caller string, q Query) (*dbR
 
 				// Record successful queries in the persistent log.  But don't log
 				// queries to the state database itself.
-				if err == nil && q.Source != s.self {
-					serr := s.state.LogQuery(ctx, caller, q, out.Elapsed)
-					if serr != nil {
-						s.logf("[tailsql] WARNING: Error logging query: %v", serr)
+				if err == nil && q.Source != s.self && s.state != nil {
+					// Use a retry loop for handling SQLite busy errors
+					const maxRetries = 3
+					var logErr error
+
+					for attempt := 0; attempt < maxRetries; attempt++ {
+						if attempt > 0 {
+							time.Sleep(getBackoffDelay(attempt))
+						}
+
+						if err := s.state.LogQuery(ctx, caller, q, out.Elapsed); err != nil {
+							if strings.Contains(err.Error(), "database is locked") ||
+								strings.Contains(err.Error(), "cannot start a transaction within a transaction") {
+								s.logf("[tailsql] Database busy, retrying query log (attempt %d): %v", attempt+1, err)
+								continue
+							}
+							logErr = err
+							break
+						}
+						// Successfully logged
+						logErr = nil
+						break
+					}
+
+					if logErr != nil {
+						s.logf("[tailsql] WARNING: Error logging query: %v", logErr)
 					}
 				}
 			}()

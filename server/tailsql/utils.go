@@ -30,13 +30,22 @@ type LocalClient interface {
 
 // uiData is the concrete type of the data value passed to the UI template.
 type uiData struct {
-	Query       string      // the original query
-	Sources     []*dbHandle // the available databases
-	Source      string      // the selected source
-	Output      *dbResult   // query results (may be nil)
-	Error       *string     // error results (may be nil)
-	Links       []UILink    // static UI links
-	RoutePrefix string      // for links to the API and static files
+	Query        string                 // the original query
+	Sources      []*dbHandle            // the available databases
+	Source       string                 // the selected source
+	Output       *dbResult              // query results (may be nil)
+	Error        *string                // error results (may be nil)
+	Links        []UILink               // static UI links
+	RoutePrefix  string                 // for links to the API and static files
+	UserInfo     *apitype.WhoIsResponse // user information from Tailscale
+	QueryLog     *dbResult              // recent query history
+	QuerySummary *QuerySummary          // summary of recent queries
+}
+
+// QuerySummary contains summary information about recent queries
+type QuerySummary struct {
+	UniqueQueries int // number of unique queries in the time window
+	HoursSpan     int // number of hours the queries span
 }
 
 // Version reports the version string of the currently running binary.
